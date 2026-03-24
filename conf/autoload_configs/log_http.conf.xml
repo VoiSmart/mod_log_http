@@ -1,10 +1,15 @@
 <configuration name="log_http.conf" description="HTTP JSON Logger">
+  <!-- Queue holds up to 25000 entries in memory. Under sustained endpoint
+       failure, memory usage grows proportionally to log message size.
+       Reduce batch-size or loglevel if memory pressure is a concern. -->
   <settings>
     <!-- URL(s) to POST logs to. Tag is part of the URL path (e.g. /freeswitch.log).
-         Multiple url params can be specified for failover. -->
+         Multiple url params can be specified for failover.
+         URL configuration is not required when loglevel=disable. -->
     <param name="url" value="http://127.0.0.1:9880/freeswitch.log"/>
 
-    <!-- Minimum log level to send: debug, info, notice, warning, error, crit, alert -->
+    <!-- Minimum log level to send: debug, info, notice, warning, error, crit, alert.
+         Set to disable to keep the module loaded but inert (no queue, worker, or logger binding). -->
     <param name="loglevel" value="warning"/>
 
     <!-- HTTP timeout in seconds -->
@@ -40,7 +45,8 @@
       <!-- <property name="server" value="fs01.example.com"/> -->
     </properties>
 
-    <!-- Map channel variables to custom JSON fields in session logs -->
+    <!-- Map channel variables to custom JSON fields in session logs.
+         These values are snapped when the log line is emitted, not when the batch is delivered. -->
     <fields>
       <!-- <field name="customer" variable="customer_account_number"/> -->
     </fields>

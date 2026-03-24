@@ -29,13 +29,23 @@
 SWITCH_MODULE_LOAD_FUNCTION(mod_log_http_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_log_http_shutdown);
 SWITCH_MODULE_DEFINITION(mod_log_http, mod_log_http_load, mod_log_http_shutdown, NULL);
+static switch_status_t mod_log_http_logger(const switch_log_node_t *node, switch_log_level_t level);
 
 #define MAX_URLS 20
 #define MAX_BATCH_SIZE 200
 #define LOG_QUEUE_SIZE 25000
 #define MAX_BACKOFF_SECS 60
+#define MAX_DELAY_SECS 300
+#define MAX_TIMEOUT_SECS 300
+#define WORKER_STARTUP_TIMEOUT_USEC 5000000
 #define DROP_WARN_INTERVAL 60000000 /* 60 seconds in microseconds */
 #define MY_SOURCE_FILE "mod_log_http.c"
+
+typedef enum {
+	WORKER_STARTUP_PENDING = 0,
+	WORKER_STARTUP_RUNNING,
+	WORKER_STARTUP_FAILED
+} worker_startup_state_t;
 
 static struct {
 	switch_memory_pool_t *pool;
@@ -44,11 +54,17 @@ static struct {
 	int url_index;
 	switch_log_level_t log_level;
 	int shutdown;
-	switch_thread_rwlock_t *shutdown_rwlock;
+	switch_thread_t *worker_thread;
+	int worker_started;
+	int logger_bound;
 	switch_queue_t *log_queue;
 	switch_event_t *session_fields;
 	switch_event_t *properties;
 	switch_log_json_format_t json_format;
+	switch_mutex_t *startup_mutex;
+	switch_thread_cond_t *startup_cond;
+	worker_startup_state_t startup_state;
+	switch_status_t startup_status;
 	/* HTTP options */
 	int timeout;
 	uint32_t retries;
@@ -68,13 +84,44 @@ static struct {
 
 static switch_time_t last_drop_warning = 0;
 
+static void signal_worker_startup(worker_startup_state_t state, switch_status_t status)
+{
+	if (!globals.startup_mutex || !globals.startup_cond) {
+		return;
+	}
+
+	switch_mutex_lock(globals.startup_mutex);
+	globals.startup_state = state;
+	globals.startup_status = status;
+	switch_thread_cond_signal(globals.startup_cond);
+	switch_mutex_unlock(globals.startup_mutex);
+}
+
+static switch_status_t append_header(switch_curl_slist_t **headers, const char *value)
+{
+	switch_curl_slist_t *new_headers = switch_curl_slist_append(*headers, value);
+
+	if (!new_headers) {
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	*headers = new_headers;
+	return SWITCH_STATUS_SUCCESS;
+}
+
 /**
- * Convert log node to JSON string
+ * Convert log node to JSON string.
+ * Called from the worker thread (not under BINDLOCK).
  */
 static char *to_json(const switch_log_node_t *node, switch_log_level_t log_level)
 {
 	char *json_text = NULL;
-	cJSON *json = switch_log_node_to_json(node, (int)log_level, &globals.json_format, globals.session_fields);
+	cJSON *json = switch_log_node_to_json(node, (int)log_level, &globals.json_format, NULL);
+
+	if (!json) {
+		return NULL;
+	}
+
 	cJSON_AddItemToObject(json, "level_name", cJSON_CreateString(switch_log_level2str(log_level)));
 	if (globals.properties) {
 		switch_event_header_t *hp;
@@ -95,6 +142,51 @@ static size_t http_callback(char *buffer, size_t size, size_t nitems, void *outs
 	(void)buffer;
 	(void)outstream;
 	return size * nitems;
+}
+
+/**
+ * Snapshot configured session fields at log time so queued entries do not
+ * depend on later session state.
+ */
+static void snapshot_session_fields(switch_log_node_t *node)
+{
+	switch_core_session_t *session;
+	switch_channel_t *channel;
+	switch_event_header_t *hp;
+
+	if (!node || zstr(node->userdata) || !globals.session_fields || !globals.session_fields->headers) {
+		return;
+	}
+
+	session = switch_core_session_locate(node->userdata);
+	if (!session) {
+		return;
+	}
+
+	channel = switch_core_session_get_channel(session);
+
+	for (hp = globals.session_fields->headers; hp; hp = hp->next) {
+		const char *val;
+
+		if (zstr(hp->name) || zstr(hp->value)) {
+			continue;
+		}
+
+		val = switch_channel_get_variable(channel, hp->value);
+		if (zstr(val)) {
+			continue;
+		}
+
+		if (!node->tags) {
+			if (switch_event_create_plain(&node->tags, SWITCH_EVENT_CHANNEL_DATA) != SWITCH_STATUS_SUCCESS) {
+				break;
+			}
+		}
+
+		switch_event_add_header_string(node->tags, SWITCH_STACK_BOTTOM, hp->name, val);
+	}
+
+	switch_core_session_rwunlock(session);
 }
 
 /**
@@ -216,7 +308,7 @@ static switch_status_t post_batch(switch_CURL *curl_handle, switch_curl_slist_t 
 		const char *url = globals.urls[globals.url_index];
 
 		if (attempt > 0) {
-			switch_yield(globals.delay * 1000000);
+			interruptible_sleep((int)globals.delay);
 			if (globals.shutdown) break;
 		}
 
@@ -232,12 +324,10 @@ static switch_status_t post_batch(switch_CURL *curl_handle, switch_curl_slist_t 
 							  url, switch_curl_easy_strerror(curl_code));
 
 			if (is_connection_error(curl_code)) {
-				/* Destroy and recreate handle to force fresh connection */
 				curl_easy_reset((CURL *)curl_handle);
 				configure_curl_handle(curl_handle, headers);
 			}
 
-			/* Rotate to next URL */
 			if (globals.url_count > 1) {
 				globals.url_index = (globals.url_index + 1) % globals.url_count;
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
@@ -276,12 +366,14 @@ static switch_status_t post_batch(switch_CURL *curl_handle, switch_curl_slist_t 
 }
 
 /**
- * Worker thread that delivers logs via HTTP
+ * Worker thread that delivers logs via HTTP.
+ * JSON serialization happens here, outside the core BINDLOCK.
  */
 static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, void *obj)
 {
 	switch_CURL *curl_handle = NULL;
 	switch_curl_slist_t *headers = NULL;
+	switch_status_t status = SWITCH_STATUS_SUCCESS;
 	int fail_count = 0;
 	char *batch[MAX_BATCH_SIZE];
 	int batch_count;
@@ -290,41 +382,65 @@ static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, voi
 	(void)thread;
 	(void)obj;
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: delivery thread started\n");
-	switch_thread_rwlock_rdlock(globals.shutdown_rwlock);
-
 	if (globals.url_count == 0) {
+		signal_worker_startup(WORKER_STARTUP_FAILED, SWITCH_STATUS_FALSE);
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: no URLs configured, exiting\n");
-		goto done;
+		return NULL;
 	}
 
 	curl_handle = switch_curl_easy_init();
-	headers = switch_curl_slist_append(NULL, "Content-Type: application/json");
-	if (globals.disable100continue) {
-		headers = switch_curl_slist_append(headers, "Expect:");
+	if (!curl_handle) {
+		signal_worker_startup(WORKER_STARTUP_FAILED, SWITCH_STATUS_MEMERR);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: failed to initialize CURL handle\n");
+		return NULL;
+	}
+
+	if ((status = append_header(&headers, "Content-Type: application/json")) != SWITCH_STATUS_SUCCESS) {
+		signal_worker_startup(WORKER_STARTUP_FAILED, status);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: failed to allocate HTTP headers\n");
+		goto done;
+	}
+
+	if (globals.disable100continue && (status = append_header(&headers, "Expect:")) != SWITCH_STATUS_SUCCESS) {
+		signal_worker_startup(WORKER_STARTUP_FAILED, status);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: failed to allocate HTTP headers\n");
+		goto done;
 	}
 	configure_curl_handle(curl_handle, headers);
+	signal_worker_startup(WORKER_STARTUP_RUNNING, SWITCH_STATUS_SUCCESS);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: delivery thread started\n");
 
 	while (!globals.shutdown) {
-		char *log;
+		switch_log_node_t *entry = NULL;
+		char *json;
 		switch_status_t result;
 
 		/* Exponential backoff between batches on consecutive failures */
 		if (fail_count > 0) {
-			int backoff = globals.delay * (1 << (fail_count > 6 ? 6 : fail_count));
-			if (backoff > MAX_BACKOFF_SECS) backoff = MAX_BACKOFF_SECS;
+			int shift = fail_count > 6 ? 6 : fail_count;
+			int backoff = (int)globals.delay << shift;
+			if (backoff > MAX_BACKOFF_SECS || backoff < 0) backoff = MAX_BACKOFF_SECS;
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
 							  "mod_log_http: backing off %d seconds before next attempt\n", backoff);
 			interruptible_sleep(backoff);
 			if (globals.shutdown) break;
 		}
 
-		/* Block on first entry */
-		if (switch_queue_pop(globals.log_queue, (void *)&log) != SWITCH_STATUS_SUCCESS) {
+		/* Block on first entry (a switch_log_node_t*) */
+		if (switch_queue_pop(globals.log_queue, (void *)&entry) != SWITCH_STATUS_SUCCESS) {
 			break;
 		}
 
-		batch[0] = log;
+		/* Serialize to JSON in this thread (not under BINDLOCK) */
+		json = to_json(entry, entry->level);
+		switch_log_node_free(&entry);
+		if (!json) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
+							  "mod_log_http: failed to serialize log entry, dropping\n");
+			continue;
+		}
+
+		batch[0] = json;
 		batch_count = 1;
 
 		/* Collect more entries for the batch with a total deadline */
@@ -334,26 +450,47 @@ static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, voi
 
 			/* First drain whatever is immediately available */
 			while (batch_count < globals.batch_size) {
-				if (switch_queue_trypop(globals.log_queue, (void *)&log) != SWITCH_STATUS_SUCCESS) {
+				if (switch_queue_trypop(globals.log_queue, (void *)&entry) != SWITCH_STATUS_SUCCESS) {
 					break;
 				}
-				batch[batch_count++] = log;
+				json = to_json(entry, entry->level);
+				switch_log_node_free(&entry);
+				if (!json) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
+									  "mod_log_http: failed to serialize log entry, dropping\n");
+					continue;
+				}
+				batch[batch_count++] = json;
 			}
 
 			/* If still room, wait up to remaining deadline */
 			while (batch_count < globals.batch_size && globals.batch_timeout_ms > 0) {
 				switch_interval_time_t remaining = deadline - switch_micro_time_now();
 				if (remaining <= 0) break;
-				if (switch_queue_pop_timeout(globals.log_queue, (void *)&log, remaining) != SWITCH_STATUS_SUCCESS) {
+				if (switch_queue_pop_timeout(globals.log_queue, (void *)&entry, remaining) != SWITCH_STATUS_SUCCESS) {
 					break;
 				}
-				batch[batch_count++] = log;
+				json = to_json(entry, entry->level);
+				switch_log_node_free(&entry);
+				if (!json) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
+									  "mod_log_http: failed to serialize log entry, dropping\n");
+					continue;
+				}
+				batch[batch_count++] = json;
 				/* Drain any further immediately available entries */
 				while (batch_count < globals.batch_size) {
-					if (switch_queue_trypop(globals.log_queue, (void *)&log) != SWITCH_STATUS_SUCCESS) {
+					if (switch_queue_trypop(globals.log_queue, (void *)&entry) != SWITCH_STATUS_SUCCESS) {
 						break;
 					}
-					batch[batch_count++] = log;
+					json = to_json(entry, entry->level);
+					switch_log_node_free(&entry);
+					if (!json) {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
+										  "mod_log_http: failed to serialize log entry, dropping\n");
+						continue;
+					}
+					batch[batch_count++] = json;
 				}
 			}
 		}
@@ -365,7 +502,7 @@ static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, voi
 			fail_count = 0;
 		} else {
 			fail_count++;
-			if (fail_count > 10) fail_count = 10; /* cap the exponent */
+			if (fail_count > 10) fail_count = 10;
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
 							  "mod_log_http: failed to deliver %d log entries (consecutive failures: %d)\n",
 							  batch_count, fail_count);
@@ -377,11 +514,12 @@ static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, voi
 		}
 	}
 
+done:
 	/* Drain remaining queue entries */
 	{
-		char *log;
-		while (switch_queue_trypop(globals.log_queue, (void *)&log) == SWITCH_STATUS_SUCCESS) {
-			switch_safe_free(log);
+		switch_log_node_t *entry;
+		while (switch_queue_trypop(globals.log_queue, (void *)&entry) == SWITCH_STATUS_SUCCESS) {
+			switch_log_node_free(&entry);
 		}
 	}
 
@@ -392,58 +530,130 @@ static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, voi
 		switch_curl_slist_free_all(headers);
 	}
 
-done:
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: delivery thread finished\n");
-	switch_thread_rwlock_unlock(globals.shutdown_rwlock);
 	return NULL;
 }
 
 /**
- * Start the delivery thread
+ * Start the delivery thread (non-detached, handle stored for join).
+ * Wait until the worker reports startup success or failure.
  */
 static void start_deliver_thread(switch_memory_pool_t *pool)
 {
-	switch_thread_t *thread;
 	switch_threadattr_t *thd_attr = NULL;
-	switch_threadattr_create(&thd_attr, pool);
-	switch_threadattr_detach_set(thd_attr, 1);
-	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-	switch_thread_create(&thread, thd_attr, deliver_http_thread, NULL, pool);
+	switch_status_t status;
+
+	if ((status = switch_threadattr_create(&thd_attr, pool)) != SWITCH_STATUS_SUCCESS) {
+		globals.startup_status = status;
+		return;
+	}
+
+	if ((status = switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE)) != SWITCH_STATUS_SUCCESS) {
+		globals.startup_status = status;
+		return;
+	}
+
+	globals.startup_state = WORKER_STARTUP_PENDING;
+	globals.startup_status = SWITCH_STATUS_SUCCESS;
+	globals.worker_thread = NULL;
+	globals.worker_started = 0;
+
+	switch_mutex_lock(globals.startup_mutex);
+	status = switch_thread_create(&globals.worker_thread, thd_attr, deliver_http_thread, NULL, pool);
+	if (status == SWITCH_STATUS_SUCCESS) {
+		while (globals.startup_state == WORKER_STARTUP_PENDING) {
+			status = switch_thread_cond_timedwait(globals.startup_cond, globals.startup_mutex, WORKER_STARTUP_TIMEOUT_USEC);
+			if (status != SWITCH_STATUS_SUCCESS) {
+				break;
+			}
+		}
+	}
+	switch_mutex_unlock(globals.startup_mutex);
+
+	if (status == SWITCH_STATUS_SUCCESS && globals.startup_state == WORKER_STARTUP_RUNNING) {
+		globals.worker_started = 1;
+		globals.startup_status = SWITCH_STATUS_SUCCESS;
+		return;
+	}
+
+	if (status != SWITCH_STATUS_SUCCESS) {
+		globals.startup_status = status;
+	} else if (globals.startup_state == WORKER_STARTUP_FAILED) {
+		if (globals.startup_status == SWITCH_STATUS_SUCCESS) {
+			globals.startup_status = SWITCH_STATUS_FALSE;
+		}
+	} else {
+		globals.startup_status = SWITCH_STATUS_TIMEOUT;
+	}
 }
 
 /**
- * Stop the delivery thread
+ * Stop the delivery thread via join
  */
 static void stop_deliver_thread(void)
 {
+	switch_status_t st;
+
+	if (!globals.worker_thread) {
+		globals.worker_started = 0;
+		return;
+	}
+
 	globals.shutdown = 1;
-	switch_queue_interrupt_all(globals.log_queue);
-	switch_thread_rwlock_wrlock(globals.shutdown_rwlock);
+	if (globals.log_queue) {
+		switch_queue_interrupt_all(globals.log_queue);
+	}
+	switch_thread_join(&st, globals.worker_thread);
+	globals.worker_thread = NULL;
+	globals.worker_started = 0;
+}
+
+static void cleanup_module_state(void)
+{
+	if (globals.logger_bound) {
+		switch_log_unbind_logger(mod_log_http_logger);
+		globals.logger_bound = 0;
+	}
+
+	stop_deliver_thread();
+
+	if (globals.session_fields) {
+		switch_event_destroy(&globals.session_fields);
+	}
+	if (globals.properties) {
+		switch_event_destroy(&globals.properties);
+	}
+
+	globals.log_queue = NULL;
 }
 
 /**
  * Logger callback from FreeSWITCH core.
- * Filters out logs originating from this module to prevent feedback loops.
+ * Runs under BINDLOCK — must be fast.
+ * Queues a lightweight node copy; JSON serialization deferred to worker.
  */
 static switch_status_t mod_log_http_logger(const switch_log_node_t *node, switch_log_level_t level)
 {
-	if (!globals.shutdown && level <= globals.log_level && level != SWITCH_LOG_CONSOLE) {
-		/* Skip our own log messages to prevent feedback loops when the endpoint is down */
+	if (globals.log_queue && !globals.shutdown && level <= globals.log_level && level != SWITCH_LOG_CONSOLE) {
+		/* Skip our own log messages to prevent feedback loops */
 		if (!strncmp(node->file, MY_SOURCE_FILE, sizeof(MY_SOURCE_FILE) - 1)) {
 			return SWITCH_STATUS_SUCCESS;
 		}
+
 		if (!zstr(node->content) && !zstr(node->content + 1)) {
-			char *log = to_json(node, level);
-			if (switch_queue_trypush(globals.log_queue, log) != SWITCH_STATUS_SUCCESS) {
-				free(log);
-				/* Rate-limited warning about dropped logs */
-				{
-					switch_time_t now = switch_micro_time_now();
-					if (now - last_drop_warning > DROP_WARN_INTERVAL) {
-						last_drop_warning = now;
-						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
-										  "mod_log_http: queue full, dropping entries. "
-										  "Is the HTTP endpoint reachable?\n");
+			switch_log_node_t *dup = switch_log_node_dup(node);
+			if (dup) {
+				snapshot_session_fields(dup);
+				if (switch_queue_trypush(globals.log_queue, dup) != SWITCH_STATUS_SUCCESS) {
+					switch_log_node_free(&dup);
+					{
+						switch_time_t now = switch_micro_time_now();
+						if (now - last_drop_warning > DROP_WARN_INTERVAL) {
+							last_drop_warning = now;
+							switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
+											  "mod_log_http: queue full, dropping entries. "
+											  "Is the HTTP endpoint reachable?\n");
+						}
 					}
 				}
 			}
@@ -511,8 +721,11 @@ static switch_status_t do_config(void)
 				}
 			} else if (!strcasecmp(name, "timeout")) {
 				int val = atoi(value);
-				if (val > 0) {
+				if (val > 0 && val <= MAX_TIMEOUT_SECS) {
 					globals.timeout = val;
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  "Invalid timeout \"%s\" (must be 1-%d)\n", value, MAX_TIMEOUT_SECS);
 				}
 			} else if (!strcasecmp(name, "retries")) {
 				int val = atoi(value);
@@ -521,8 +734,11 @@ static switch_status_t do_config(void)
 				}
 			} else if (!strcasecmp(name, "delay")) {
 				int val = atoi(value);
-				if (val > 0) {
+				if (val > 0 && val <= MAX_DELAY_SECS) {
 					globals.delay = (uint32_t)val;
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  "Invalid delay \"%s\" (must be 1-%d)\n", value, MAX_DELAY_SECS);
 				}
 			} else if (!strcasecmp(name, "batch-size")) {
 				int val = atoi(value);
@@ -573,9 +789,7 @@ static switch_status_t do_config(void)
 									  "Ignoring empty channel variable for session field \"%s\"\n", fname);
 					continue;
 				}
-				switch_event_add_header_string(globals.session_fields, SWITCH_STACK_BOTTOM,
-											   switch_core_strdup(globals.pool, fname),
-											   switch_core_strdup(globals.pool, variable));
+				switch_event_add_header_string(globals.session_fields, SWITCH_STACK_BOTTOM, fname, variable);
 			}
 		}
 
@@ -597,9 +811,7 @@ static switch_status_t do_config(void)
 										  "Ignoring empty value for property \"%s\"\n", pname);
 						continue;
 					}
-					switch_event_add_header_string(globals.properties, SWITCH_STACK_BOTTOM,
-												   switch_core_strdup(globals.pool, pname),
-												   switch_core_strdup(globals.pool, pvalue));
+					switch_event_add_header_string(globals.properties, SWITCH_STACK_BOTTOM, pname, pvalue);
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
 									  "Added property: \"%s\" = \"%s\"\n", pname, pvalue);
 				}
@@ -607,7 +819,7 @@ static switch_status_t do_config(void)
 		}
 	}
 
-	if (globals.url_count == 0) {
+	if (globals.log_level != SWITCH_LOG_DISABLE && globals.url_count == 0) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
 						  "No URL configured. At least one url param is required.\n");
 		switch_xml_free(xml);
@@ -620,6 +832,8 @@ static switch_status_t do_config(void)
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_log_http_load)
 {
+	switch_status_t status;
+
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
 	memset(&globals, 0, sizeof(globals));
@@ -640,32 +854,64 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_log_http_load)
 	globals.json_format.short_message.name = "short_message";
 	globals.json_format.sequence.name = "sequence";
 
-	switch_event_create_plain(&globals.session_fields, SWITCH_EVENT_CHANNEL_DATA);
-	switch_event_create_plain(&globals.properties, SWITCH_EVENT_CLONE);
+	if ((status = switch_event_create_plain(&globals.session_fields, SWITCH_EVENT_CHANNEL_DATA)) != SWITCH_STATUS_SUCCESS) {
+		return status;
+	}
+
+	if ((status = switch_event_create_plain(&globals.properties, SWITCH_EVENT_CLONE)) != SWITCH_STATUS_SUCCESS) {
+		cleanup_module_state();
+		return status;
+	}
 
 	if (do_config() != SWITCH_STATUS_SUCCESS) {
+		cleanup_module_state();
 		return SWITCH_STATUS_TERM;
 	}
 
-	switch_thread_rwlock_create(&globals.shutdown_rwlock, pool);
-	switch_queue_create(&globals.log_queue, LOG_QUEUE_SIZE, pool);
+	if (globals.log_level == SWITCH_LOG_DISABLE) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
+						  "mod_log_http: loglevel=disable, module loaded without binding logger\n");
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	if ((status = switch_mutex_init(&globals.startup_mutex, SWITCH_MUTEX_NESTED, pool)) != SWITCH_STATUS_SUCCESS) {
+		cleanup_module_state();
+		return status;
+	}
+
+	if ((status = switch_thread_cond_create(&globals.startup_cond, pool)) != SWITCH_STATUS_SUCCESS) {
+		cleanup_module_state();
+		return status;
+	}
+
+	if ((status = switch_queue_create(&globals.log_queue, LOG_QUEUE_SIZE, pool)) != SWITCH_STATUS_SUCCESS) {
+		cleanup_module_state();
+		return status;
+	}
 
 	start_deliver_thread(globals.pool);
-	switch_log_bind_logger(mod_log_http_logger, SWITCH_LOG_DEBUG, SWITCH_FALSE);
+	if (!globals.worker_started) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+						  "mod_log_http: failed to start delivery thread (status=%d)\n", globals.startup_status);
+		cleanup_module_state();
+		return SWITCH_STATUS_TERM;
+	}
+
+	if ((status = switch_log_bind_logger(mod_log_http_logger, globals.log_level, SWITCH_FALSE)) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+						  "mod_log_http: failed to bind logger (status=%d)\n", status);
+		cleanup_module_state();
+		return status;
+	}
+
+	globals.logger_bound = 1;
 
 	return SWITCH_STATUS_SUCCESS;
 }
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_log_http_shutdown)
 {
-	switch_log_unbind_logger(mod_log_http_logger);
-	stop_deliver_thread();
-	if (globals.session_fields) {
-		switch_event_destroy(&globals.session_fields);
-	}
-	if (globals.properties) {
-		switch_event_destroy(&globals.properties);
-	}
+	cleanup_module_state();
 	return SWITCH_STATUS_SUCCESS;
 }
 
