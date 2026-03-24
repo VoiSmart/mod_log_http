@@ -33,6 +33,13 @@
     <!-- <param name="enable-cacert-check" value="true"/> -->
     <!-- <param name="enable-ssl-verifyhost" value="true"/> -->
 
+    <!-- Static key/value properties added to every JSON log entry -->
+    <properties>
+      <property name="ident" value="freeswitch"/>
+      <!-- <property name="environment" value="production"/> -->
+      <!-- <property name="server" value="fs01.example.com"/> -->
+    </properties>
+
     <!-- Map channel variables to custom JSON fields in session logs -->
     <fields>
       <!-- <field name="customer" variable="customer_account_number"/> -->

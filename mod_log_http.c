@@ -47,6 +47,7 @@ static struct {
 	switch_thread_rwlock_t *shutdown_rwlock;
 	switch_queue_t *log_queue;
 	switch_event_t *session_fields;
+	switch_event_t *properties;
 	switch_log_json_format_t json_format;
 	/* HTTP options */
 	int timeout;
@@ -75,6 +76,12 @@ static char *to_json(const switch_log_node_t *node, switch_log_level_t log_level
 	char *json_text = NULL;
 	cJSON *json = switch_log_node_to_json(node, (int)log_level, &globals.json_format, globals.session_fields);
 	cJSON_AddItemToObject(json, "level_name", cJSON_CreateString(switch_log_level2str(log_level)));
+	if (globals.properties) {
+		switch_event_header_t *hp;
+		for (hp = globals.properties->headers; hp; hp = hp->next) {
+			cJSON_AddItemToObject(json, hp->name, cJSON_CreateString(hp->value));
+		}
+	}
 	json_text = cJSON_PrintUnformatted(json);
 	cJSON_Delete(json);
 	return json_text;
@@ -571,6 +578,33 @@ static switch_status_t do_config(void)
 											   switch_core_strdup(globals.pool, variable));
 			}
 		}
+
+		/* Parse static properties to add to every log entry */
+		{
+			switch_xml_t properties = switch_xml_child(settings, "properties");
+			if (properties) {
+				switch_xml_t prop;
+				for (prop = switch_xml_child(properties, "property"); prop; prop = prop->next) {
+					char *pname = (char *)switch_xml_attr_soft(prop, "name");
+					char *pvalue = (char *)switch_xml_attr_soft(prop, "value");
+					if (zstr(pname)) {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+										  "Ignoring unnamed property\n");
+						continue;
+					}
+					if (zstr(pvalue)) {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+										  "Ignoring empty value for property \"%s\"\n", pname);
+						continue;
+					}
+					switch_event_add_header_string(globals.properties, SWITCH_STACK_BOTTOM,
+												   switch_core_strdup(globals.pool, pname),
+												   switch_core_strdup(globals.pool, pvalue));
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+									  "Added property: \"%s\" = \"%s\"\n", pname, pvalue);
+				}
+			}
+		}
 	}
 
 	if (globals.url_count == 0) {
@@ -596,8 +630,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_log_http_load)
 	globals.json_format.timestamp.name = "timestamp";
 	globals.json_format.timestamp_divisor = 1000000; /* microseconds to seconds */
 	globals.json_format.level.name = "level";
-	globals.json_format.ident.name = "ident";
-	globals.json_format.ident.value = "freeswitch";
 	globals.json_format.pid.name = "pid";
 	globals.json_format.pid.value = switch_core_sprintf(pool, "%d", (int)getpid());
 	globals.json_format.uuid.name = "uuid";
@@ -609,6 +641,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_log_http_load)
 	globals.json_format.sequence.name = "sequence";
 
 	switch_event_create_plain(&globals.session_fields, SWITCH_EVENT_CHANNEL_DATA);
+	switch_event_create_plain(&globals.properties, SWITCH_EVENT_CLONE);
 
 	if (do_config() != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_TERM;
@@ -629,6 +662,9 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_log_http_shutdown)
 	stop_deliver_thread();
 	if (globals.session_fields) {
 		switch_event_destroy(&globals.session_fields);
+	}
+	if (globals.properties) {
+		switch_event_destroy(&globals.properties);
 	}
 	return SWITCH_STATUS_SUCCESS;
 }
