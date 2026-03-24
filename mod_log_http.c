@@ -85,6 +85,8 @@ static char *to_json(const switch_log_node_t *node, switch_log_level_t log_level
  */
 static size_t http_callback(char *buffer, size_t size, size_t nitems, void *outstream)
 {
+	(void)buffer;
+	(void)outstream;
 	return size * nitems;
 }
 
@@ -277,6 +279,9 @@ static void *SWITCH_THREAD_FUNC deliver_http_thread(switch_thread_t *thread, voi
 	char *batch[MAX_BATCH_SIZE];
 	int batch_count;
 	int i;
+
+	(void)thread;
+	(void)obj;
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "mod_log_http: delivery thread started\n");
 	switch_thread_rwlock_rdlock(globals.shutdown_rwlock);
