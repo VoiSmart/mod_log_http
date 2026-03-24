@@ -1,0 +1,41 @@
+<configuration name="log_http.conf" description="HTTP JSON Logger">
+  <settings>
+    <!-- URL(s) to POST logs to. Tag is part of the URL path (e.g. /freeswitch.log).
+         Multiple url params can be specified for failover. -->
+    <param name="url" value="http://127.0.0.1:9880/freeswitch.log"/>
+
+    <!-- Minimum log level to send: debug, info, notice, warning, error, crit, alert -->
+    <param name="loglevel" value="warning"/>
+
+    <!-- HTTP timeout in seconds -->
+    <param name="timeout" value="5"/>
+
+    <!-- Number of retry attempts per batch on failure (0 = no retries, just 1 attempt) -->
+    <param name="retries" value="3"/>
+
+    <!-- Delay in seconds between retries -->
+    <param name="delay" value="1"/>
+
+    <!-- Number of log entries to batch per HTTP POST (1 = no batching) -->
+    <param name="batch-size" value="10"/>
+
+    <!-- Total deadline in milliseconds to fill a batch before flushing (0 = no wait) -->
+    <param name="batch-timeout-ms" value="500"/>
+
+    <!-- Disable HTTP 100-Continue behavior -->
+    <!-- <param name="disable-100-continue" value="true"/> -->
+
+    <!-- SSL/TLS options -->
+    <!-- <param name="ssl-cert-file" value="/path/to/cert.pem"/> -->
+    <!-- <param name="ssl-key-file" value="/path/to/key.pem"/> -->
+    <!-- <param name="ssl-key-password" value="password"/> -->
+    <!-- <param name="ssl-cacert-file" value="/path/to/ca.pem"/> -->
+    <!-- <param name="enable-cacert-check" value="true"/> -->
+    <!-- <param name="enable-ssl-verifyhost" value="true"/> -->
+
+    <!-- Map channel variables to custom JSON fields in session logs -->
+    <fields>
+      <!-- <field name="customer" variable="customer_account_number"/> -->
+    </fields>
+  </settings>
+</configuration>
