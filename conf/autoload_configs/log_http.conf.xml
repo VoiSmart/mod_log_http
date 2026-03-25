@@ -38,11 +38,23 @@
     <!-- <param name="enable-cacert-check" value="true"/> -->
     <!-- <param name="enable-ssl-verifyhost" value="true"/> -->
 
-    <!-- Static key/value properties added to every JSON log entry -->
+    <!-- Static properties added to every JSON log entry.
+         Supports nested objects and typed scalar values:
+         string (default), bool, int, number, null. -->
     <properties>
       <property name="ident" value="freeswitch"/>
       <!-- <property name="environment" value="production"/> -->
       <!-- <property name="server" value="fs01.example.com"/> -->
+      <!--
+      <property name="somefield">
+        <property name="prop" value="hello"/>
+        <property name="zoo" value="baz"/>
+        <property name="abool" type="bool" value="true"/>
+        <property name="anint" type="int" value="123"/>
+        <property name="anumber" type="number" value="12.5"/>
+        <property name="anull" type="null"/>
+      </property>
+      -->
     </properties>
 
     <!-- Map channel variables to custom JSON fields in session logs.

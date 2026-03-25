@@ -23,6 +23,8 @@
 #include <switch.h>
 #include <switch_curl.h>
 
+#include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -59,7 +61,7 @@ static struct {
 	int logger_bound;
 	switch_queue_t *log_queue;
 	switch_event_t *session_fields;
-	switch_event_t *properties;
+	cJSON *static_properties;
 	switch_log_json_format_t json_format;
 	switch_mutex_t *startup_mutex;
 	switch_thread_cond_t *startup_cond;
@@ -83,6 +85,298 @@ static struct {
 } globals;
 
 static switch_time_t last_drop_warning = 0;
+
+static switch_bool_t generated_field_name_matches(const char *name, const char *generated_name)
+{
+	return (!zstr(name) && !zstr(generated_name) && !strcmp(name, generated_name)) ? SWITCH_TRUE : SWITCH_FALSE;
+}
+
+static switch_bool_t static_property_conflicts_with_generated_field(const char *name)
+{
+	if (zstr(name)) {
+		return SWITCH_FALSE;
+	}
+
+	if (generated_field_name_matches(name, globals.json_format.version.name) ||
+		generated_field_name_matches(name, globals.json_format.host.name) ||
+		generated_field_name_matches(name, globals.json_format.timestamp.name) ||
+		generated_field_name_matches(name, globals.json_format.level.name) ||
+		generated_field_name_matches(name, globals.json_format.ident.name) ||
+		generated_field_name_matches(name, globals.json_format.pid.name) ||
+		generated_field_name_matches(name, globals.json_format.uuid.name) ||
+		generated_field_name_matches(name, globals.json_format.file.name) ||
+		generated_field_name_matches(name, globals.json_format.line.name) ||
+		generated_field_name_matches(name, globals.json_format.function.name) ||
+		generated_field_name_matches(name, globals.json_format.full_message.name) ||
+		generated_field_name_matches(name, globals.json_format.short_message.name) ||
+		generated_field_name_matches(name, globals.json_format.sequence.name) ||
+		generated_field_name_matches(name, "level_name")) {
+		return SWITCH_TRUE;
+	}
+
+	return SWITCH_FALSE;
+}
+
+static char *property_path_join(const char *parent_path, const char *name)
+{
+	if (zstr(name)) {
+		return switch_mprintf("%s", zstr(parent_path) ? "<unnamed>" : parent_path);
+	}
+
+	if (zstr(parent_path)) {
+		return switch_mprintf("%s", name);
+	}
+
+	return switch_mprintf("%s.%s", parent_path, name);
+}
+
+static switch_status_t parse_static_property_children(switch_xml_t parent, cJSON *target, const char *parent_path, switch_bool_t top_level);
+
+static cJSON *parse_static_property_item(switch_xml_t prop, const char *property_path, switch_status_t *status)
+{
+	const char *ptype = switch_xml_attr(prop, "type");
+	const char *pvalue = switch_xml_attr(prop, "value");
+	switch_xml_t child = switch_xml_child(prop, "property");
+	switch_bool_t has_object_children = child ? SWITCH_TRUE : SWITCH_FALSE;
+	switch_bool_t explicit_object = (!zstr(ptype) && !strcasecmp(ptype, "object")) ? SWITCH_TRUE : SWITCH_FALSE;
+	cJSON *item = NULL;
+
+	*status = SWITCH_STATUS_FALSE;
+
+	if (has_object_children) {
+		if (!zstr(ptype) && !explicit_object) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": object property cannot use type \"%s\"\n",
+							  property_path, ptype);
+			return NULL;
+		}
+
+		if (pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring value attribute for object property \"%s\"\n",
+							  property_path);
+		}
+
+		item = cJSON_CreateObject();
+		if (!item) {
+			*status = SWITCH_STATUS_MEMERR;
+			return NULL;
+		}
+
+		*status = parse_static_property_children(prop, item, property_path, SWITCH_FALSE);
+		if (*status != SWITCH_STATUS_SUCCESS) {
+			cJSON_Delete(item);
+			return NULL;
+		}
+
+		return item;
+	}
+
+	if (explicit_object) {
+		if (pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring value attribute for object property \"%s\"\n",
+							  property_path);
+		}
+
+		item = cJSON_CreateObject();
+		if (!item) {
+			*status = SWITCH_STATUS_MEMERR;
+			return NULL;
+		}
+
+		*status = SWITCH_STATUS_SUCCESS;
+		return item;
+	}
+
+	if (zstr(ptype) || !strcasecmp(ptype, "string")) {
+		if (!pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": missing value attribute\n",
+							  property_path);
+			return NULL;
+		}
+
+		item = cJSON_CreateString(pvalue);
+	} else if (!strcasecmp(ptype, "bool")) {
+		if (!pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": missing value attribute\n",
+							  property_path);
+			return NULL;
+		}
+
+		if (switch_true(pvalue)) {
+			item = cJSON_CreateTrue();
+		} else if (switch_false(pvalue)) {
+			item = cJSON_CreateFalse();
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": invalid bool value \"%s\"\n",
+							  property_path, pvalue);
+			return NULL;
+		}
+	} else if (!strcasecmp(ptype, "int")) {
+		char *end = NULL;
+		long value;
+
+		if (!pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": missing value attribute\n",
+							  property_path);
+			return NULL;
+		}
+
+		errno = 0;
+		value = strtol(pvalue, &end, 10);
+		if (end == pvalue || *end != '\0' || errno == ERANGE || value < INT_MIN || value > INT_MAX) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": invalid int value \"%s\"\n",
+							  property_path, pvalue);
+			return NULL;
+		}
+
+		item = cJSON_CreateNumber((double)value);
+	} else if (!strcasecmp(ptype, "number")) {
+		char *end = NULL;
+		double value;
+
+		if (!pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": missing value attribute\n",
+							  property_path);
+			return NULL;
+		}
+
+		errno = 0;
+		value = strtod(pvalue, &end);
+		if (end == pvalue || *end != '\0' || errno == ERANGE) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring property \"%s\": invalid number value \"%s\"\n",
+							  property_path, pvalue);
+			return NULL;
+		}
+
+		item = cJSON_CreateNumber(value);
+	} else if (!strcasecmp(ptype, "null")) {
+		if (pvalue) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring value attribute for null property \"%s\"\n",
+							  property_path);
+		}
+
+		item = cJSON_CreateNull();
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "Ignoring property \"%s\": unsupported type \"%s\"\n",
+						  property_path, ptype);
+		return NULL;
+	}
+
+	if (!item) {
+		*status = SWITCH_STATUS_MEMERR;
+		return NULL;
+	}
+
+	*status = SWITCH_STATUS_SUCCESS;
+	return item;
+}
+
+static switch_status_t parse_static_property_children(switch_xml_t parent, cJSON *target, const char *parent_path, switch_bool_t top_level)
+{
+	switch_xml_t prop;
+
+	for (prop = switch_xml_child(parent, "property"); prop; prop = prop->next) {
+		const char *pname = switch_xml_attr(prop, "name");
+		char *property_path = NULL;
+		cJSON *item = NULL;
+		switch_status_t status = SWITCH_STATUS_SUCCESS;
+
+		if (zstr(pname)) {
+			if (zstr(parent_path)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "Ignoring unnamed property\n");
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "Ignoring unnamed property under \"%s\"\n",
+								  parent_path);
+			}
+			continue;
+		}
+
+		property_path = property_path_join(parent_path, pname);
+		if (!property_path) {
+			return SWITCH_STATUS_MEMERR;
+		}
+
+		if (top_level && static_property_conflicts_with_generated_field(pname)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring static property \"%s\": conflicts with generated log field\n",
+							  property_path);
+			free(property_path);
+			continue;
+		}
+
+		if (cJSON_GetObjectItemCaseSensitive(target, pname)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Ignoring duplicate property \"%s\"\n",
+							  property_path);
+			free(property_path);
+			continue;
+		}
+
+		item = parse_static_property_item(prop, property_path, &status);
+		if (status == SWITCH_STATUS_MEMERR) {
+			free(property_path);
+			return status;
+		}
+
+		if (status == SWITCH_STATUS_SUCCESS && item) {
+			cJSON_AddItemToObject(target, pname, item);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+							  "Added static property \"%s\"\n",
+							  property_path);
+		}
+
+		free(property_path);
+	}
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+static void merge_static_properties(cJSON *json)
+{
+	cJSON *dup;
+	cJSON *child;
+	cJSON *next;
+
+	if (!json || !globals.static_properties || !globals.static_properties->child) {
+		return;
+	}
+
+	dup = cJSON_Duplicate(globals.static_properties, cJSON_True);
+	if (!dup) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "mod_log_http: failed to duplicate static properties, continuing without them\n");
+		return;
+	}
+
+	for (child = dup->child; child; child = next) {
+		next = child->next;
+
+		if (cJSON_GetObjectItemCaseSensitive(json, child->string)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Skipping static property \"%s\": log entry already contains that field\n",
+							  switch_str_nil(child->string));
+			cJSON_Delete(cJSON_DetachItemViaPointer(dup, child));
+			continue;
+		}
+
+		cJSON_AddItemToObject(json, child->string, cJSON_DetachItemViaPointer(dup, child));
+	}
+
+	cJSON_Delete(dup);
+}
 
 static void signal_worker_startup(worker_startup_state_t state, switch_status_t status)
 {
@@ -123,12 +417,7 @@ static char *to_json(const switch_log_node_t *node, switch_log_level_t log_level
 	}
 
 	cJSON_AddItemToObject(json, "level_name", cJSON_CreateString(switch_log_level2str(log_level)));
-	if (globals.properties) {
-		switch_event_header_t *hp;
-		for (hp = globals.properties->headers; hp; hp = hp->next) {
-			cJSON_AddItemToObject(json, hp->name, cJSON_CreateString(hp->value));
-		}
-	}
+	merge_static_properties(json);
 	json_text = cJSON_PrintUnformatted(json);
 	cJSON_Delete(json);
 	return json_text;
@@ -620,8 +909,9 @@ static void cleanup_module_state(void)
 	if (globals.session_fields) {
 		switch_event_destroy(&globals.session_fields);
 	}
-	if (globals.properties) {
-		switch_event_destroy(&globals.properties);
+	if (globals.static_properties) {
+		cJSON_Delete(globals.static_properties);
+		globals.static_properties = NULL;
 	}
 
 	globals.log_queue = NULL;
@@ -668,6 +958,7 @@ static switch_status_t mod_log_http_logger(const switch_log_node_t *node, switch
 static switch_status_t do_config(void)
 {
 	switch_xml_t cfg, xml, settings;
+	switch_status_t status = SWITCH_STATUS_SUCCESS;
 
 	if (!(xml = switch_xml_open_cfg("log_http.conf", &cfg, NULL))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Open of log_http.conf failed\n");
@@ -797,23 +1088,10 @@ static switch_status_t do_config(void)
 		{
 			switch_xml_t properties = switch_xml_child(settings, "properties");
 			if (properties) {
-				switch_xml_t prop;
-				for (prop = switch_xml_child(properties, "property"); prop; prop = prop->next) {
-					char *pname = (char *)switch_xml_attr_soft(prop, "name");
-					char *pvalue = (char *)switch_xml_attr_soft(prop, "value");
-					if (zstr(pname)) {
-						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-										  "Ignoring unnamed property\n");
-						continue;
-					}
-					if (zstr(pvalue)) {
-						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-										  "Ignoring empty value for property \"%s\"\n", pname);
-						continue;
-					}
-					switch_event_add_header_string(globals.properties, SWITCH_STACK_BOTTOM, pname, pvalue);
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-									  "Added property: \"%s\" = \"%s\"\n", pname, pvalue);
+				status = parse_static_property_children(properties, globals.static_properties, NULL, SWITCH_TRUE);
+				if (status != SWITCH_STATUS_SUCCESS) {
+					switch_xml_free(xml);
+					return status;
 				}
 			}
 		}
@@ -858,14 +1136,15 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_log_http_load)
 		return status;
 	}
 
-	if ((status = switch_event_create_plain(&globals.properties, SWITCH_EVENT_CLONE)) != SWITCH_STATUS_SUCCESS) {
+	globals.static_properties = cJSON_CreateObject();
+	if (!globals.static_properties) {
 		cleanup_module_state();
-		return status;
+		return SWITCH_STATUS_MEMERR;
 	}
 
-	if (do_config() != SWITCH_STATUS_SUCCESS) {
+	if ((status = do_config()) != SWITCH_STATUS_SUCCESS) {
 		cleanup_module_state();
-		return SWITCH_STATUS_TERM;
+		return status;
 	}
 
 	if (globals.log_level == SWITCH_LOG_DISABLE) {
